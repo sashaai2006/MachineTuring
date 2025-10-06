@@ -1,363 +1,380 @@
 #pragma once
 
-#include "TuringEntities.h"
-#include "LazySeq.h"
-#include "Gen.h"
-#include "Mem.h"
+#include "SmartPtrs.h"
+#include "StatisticsManager.h"
+#include "TransitionManager.h"
+#include "StateManager.h"
+#include "TuringStrip.h"
+#include "HeadManager.h"
 
-#include <iostream>
 #include <stdexcept>
-#include <chrono>
+#include <sstream>
 
 /**
- * Машина Тьюринга - комплексная абстрактная вычислительная модель
- * 
- * Основана на LazySequence для эффективного моделирования бесконечной ленты.
- * Использует четкое разделение ответственности между компонентами.
- * 
- * Компоненты:
- * - TransitionManager: Управление правилами переходов
- * - StateManager: Управление состояниями
- * - TuringTape: Лента на основе LazySeq
- * - HeadManager: Управление головкой чтения/записи
+ * Результат выполнения машины Тьюринга
+ */
+enum class ExecutionResult {
+    ACCEPTED,     // Принято (достигнуто конечное состояние)
+    REJECTED,     // Отклонено (нет правила для перехода)
+    TIMEOUT,      // Превышен лимит шагов
+    ERROR         // Ошибка выполнения
+};
+
+/**
+ * Машина Тьюринга
+ * Основной класс, инкапсулирующий все компоненты машины Тьюринга
+ * Использует композицию для управления состояниями, лентой, правилами переходов и статистикой
  */
 template <typename State, typename Symbol>
-class MachineTuring {
-public:
-    using Rule = TransitionRule<State, Symbol>;
-    
+class TuringMachine {
 private:
-    // Компоненты машины (четкое разделение ответственности)
-    TransitionManager<State, Symbol> transitions_;    // Правила переходов
-    StateManager<State> states_;                     // Управление состояниями
-    TuringTape<Symbol> tape_;                        // Лента на основе LazySeq
-    HeadManager head_;                               // Управление головкой
-    
-    // Конфигурация выполнения
-    size_t step_count_;           // Количество выполненных шагов
-    size_t max_steps_;            // Максимальное количество шагов
-    bool debug_mode_;             // Режим отладки
-    
-    // Статистика выполнения
-    std::chrono::milliseconds execution_time_;  // Время выполнения
+    // Используем твои самописные умные указатели
+    UniquePtr<StateManager<State>> state_manager_;
+    UniquePtr<TuringStrip<Symbol>> strip_;  // Переименовано с tape_ на strip_
+    UniquePtr<TransitionManager<State, Symbol>> transition_manager_;
+    UniquePtr<HeadManager> head_manager_;
+    UniquePtr<StatisticsManager> statistics_manager_;
     
 public:
     /**
      * Конструктор машины Тьюринга
-     * @param blank_symbol Пустой символ для заполнения ленты
      * @param initial_state Начальное состояние
-     * @param max_steps Максимальное количество шагов (защита от зацикливания)
-     * @param initial_head_pos Начальная позиция головки
+     * @param blank_symbol Пустой символ
+     * @param initial_data Начальные данные на ленте
+     * @param initial_head_position Начальная позиция головки
      */
-    explicit MachineTuring(const Symbol& blank_symbol, 
-                          const State& initial_state,
-                          size_t max_steps = 100000,
-                          int initial_head_pos = 0)
-        : transitions_(),
-          states_(initial_state),
-          tape_(blank_symbol),
-          head_(initial_head_pos),
-          step_count_(0),
-          max_steps_(max_steps),
-          debug_mode_(false),
-          execution_time_(0) {}
-    
-    /**
-     * Копирующий конструктор
-     */
-    MachineTuring(const MachineTuring& other)
-        : transitions_(other.transitions_),
-          states_(other.states_),
-          tape_(other.tape_),
-          head_(other.head_),
-          step_count_(other.step_count_),
-          max_steps_(other.max_steps_),
-          debug_mode_(other.debug_mode_),
-          execution_time_(other.execution_time_) {}
-    
-    /**
-     * Оператор присваивания
-     */
-    MachineTuring& operator=(const MachineTuring& other) {
-        if (this != &other) {
-            transitions_ = other.transitions_;
-            states_ = other.states_;
-            tape_ = other.tape_;
-            head_ = other.head_;
-            step_count_ = other.step_count_;
-            max_steps_ = other.max_steps_;
-            debug_mode_ = other.debug_mode_;
-            execution_time_ = other.execution_time_;
-        }
-        return *this;
-    }
-    
-    // =================
-    // Настройка машины
-    // =================
+    explicit TuringMachine(const State& initial_state, 
+                          const Symbol& blank_symbol,
+                          const std::vector<Symbol>& initial_data = {},
+                          int initial_head_position = 0)
+        : state_manager_(UniquePtr<StateManager<State>>::MakeUnique(initial_state)),
+          strip_(UniquePtr<TuringStrip<Symbol>>::MakeUnique(blank_symbol, initial_data)),
+          transition_manager_(UniquePtr<TransitionManager<State, Symbol>>::MakeUnique()),
+          head_manager_(UniquePtr<HeadManager>::MakeUnique(initial_head_position)),
+          statistics_manager_(UniquePtr<StatisticsManager>::MakeUnique()) {}
     
     /**
      * Добавить правило перехода
      */
-    void AddRule(const Rule& rule) {
-        transitions_.AddRule(rule);
-    }
-    
-    void AddRule(const State& from_state, const Symbol& read_symbol,
-                 const State& to_state, const Symbol& write_symbol,
-                 Direction direction) {
-        transitions_.AddRule(from_state, read_symbol, to_state, write_symbol, direction);
+    void AddTransition(const State& from_state, const Symbol& read_symbol,
+                      const State& to_state, const Symbol& write_symbol,
+                      Direction direction) {
+        transition_manager_->AddRule(from_state, read_symbol, to_state, write_symbol, direction);
     }
     
     /**
      * Добавить конечное состояние
      */
     void AddFinalState(const State& state) {
-        states_.AddFinalState(state);
+        state_manager_->AddFinalState(state);
     }
     
     /**
-     * Установить начальные данные на ленте
-     * @param input Входные данные
-     * @param start_position Позиция для размещения данных
-     */
-    void SetInput(const std::vector<Symbol>& input, int start_position = 0) {
-        // Очищаем ленту и устанавливаем новые данные
-        tape_.Reset(input);
-        
-        // Устанавливаем позицию головки
-        head_.SetPosition(start_position);
-        
-        // Сбрасываем состояние и счётчики
-        states_.Reset();
-        step_count_ = 0;
-        execution_time_ = std::chrono::milliseconds(0);
-    }
-    
-    /**
-     * Включить/выключить режим отладки
-     */
-    void SetDebugMode(bool enable) {
-        debug_mode_ = enable;
-    }
-    
-    // =================
-    // Выполнение
-    // =================
-    
-    /**
-     * Выполнить один шаг вычисления
-     * @return true, если шаг выполнен; false, если машина остановилась
+     * Выполнить один шаг машины Тьюринга
+     * @return true если шаг выполнен успешно, false если нет правила для перехода
      */
     bool Step() {
-        // Проверяем условия остановки
-        if (states_.IsInFinalState() || step_count_ >= max_steps_) {
+        // Проверяем, не превышен ли лимит шагов
+        if (statistics_manager_->IsStepLimitExceeded()) {
             return false;
         }
         
-        // Читаем текущий символ
-        Symbol current_symbol = tape_.GetSymbolAt(head_.GetPosition());
+        // Получаем текущее состояние и символ под головкой
+        const State& current_state = state_manager_->GetCurrentState();
+        Symbol current_symbol = strip_->GetSymbolAt(head_manager_->GetPosition());
         
-        // Ищем применимое правило
-        auto rule_opt = transitions_.FindRule(states_.GetCurrentState(), current_symbol);
+        // Ищем правило для текущей конфигурации
+        auto rule = transition_manager_->FindRule(current_state, current_symbol);
         
-        if (!rule_opt) {
-            // Нет применимого правила - остановка
-            return false;
+        if (!rule) {
+            return false;  // Нет правила - останавливаемся
         }
         
-        const Rule& rule = *rule_opt;
+        // Применяем правило
+        state_manager_->SetCurrentState(rule->to_state);
+        strip_->SetSymbolAt(head_manager_->GetPosition(), rule->write_symbol);
+        head_manager_->Move(rule->direction);
         
-        // Отладочный вывод перед применением правила
-        if (debug_mode_) {
-            PrintDebugStep(rule);
-        }
-        
-        // Применяем правило:
-        // 1. Записываем новый символ
-        tape_.SetSymbolAt(head_.GetPosition(), rule.write_symbol);
-        
-        // 2. Переходим в новое состояние
-        states_.SetCurrentState(rule.to_state);
-        
-        // 3. Двигаем головку
-        head_.Move(rule.direction);
-        
-        // Увеличиваем счётчик шагов
-        step_count_++;
+        // Обновляем статистику
+        statistics_manager_->IncrementStepCount();
         
         return true;
     }
     
     /**
-     * Выполнить машину до остановки
-     * @return true, если машина завершилась в конечном состоянии
+     * Запустить машину до остановки
+     * @param max_steps Максимальное количество шагов (0 = использовать настройки StatisticsManager)
+     * @return Результат выполнения
      */
-    bool Run() {
-        auto start_time = std::chrono::high_resolution_clock::now();
-        
-        // Выполняем шаги до остановки
-        while (Step()) {
-            // Продолжаем выполнение
+    ExecutionResult Run(size_t max_steps = 0) {
+        if (max_steps > 0) {
+            statistics_manager_->SetMaxSteps(max_steps);
         }
         
-        auto end_time = std::chrono::high_resolution_clock::now();
-        execution_time_ = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        statistics_manager_->StartExecution();
         
-        return states_.IsInFinalState();
+        try {
+            while (true) {
+                // Проверяем конечное состояние
+                if (state_manager_->IsInFinalState()) {
+                    statistics_manager_->EndExecution();
+                    return ExecutionResult::ACCEPTED;
+                }
+                
+                // Проверяем превышение лимита шагов
+                if (statistics_manager_->IsStepLimitExceeded()) {
+                    statistics_manager_->EndExecution();
+                    return ExecutionResult::TIMEOUT;
+                }
+                
+                // Выполняем шаг
+                if (!Step()) {
+                    statistics_manager_->EndExecution();
+                    return ExecutionResult::REJECTED;
+                }
+            }
+        } catch (const std::exception&) {
+            statistics_manager_->EndExecution();
+            return ExecutionResult::ERROR;
+        }
     }
     
-    // =================
-    // Инспекция состояния
-    // =================
+    /**
+     * Сбросить машину в начальное состояние
+     */
+    void Reset(const std::vector<Symbol>& new_data = {}) {
+        state_manager_->Reset();
+        head_manager_->Reset();
+        strip_->Reset(new_data);
+        statistics_manager_->Reset();
+    }
+    
+    // ===================
+    // Геттеры для доступа к компонентам
+    // ===================
     
     /**
      * Получить текущее состояние
      */
     const State& GetCurrentState() const {
-        return states_.GetCurrentState();
+        return state_manager_->GetCurrentState();
     }
     
     /**
-     * Получить текущую позицию головки
+     * Получить позицию головки
      */
     int GetHeadPosition() const {
-        return head_.GetPosition();
+        return head_manager_->GetPosition();
+    }
+    
+    /**
+     * Получить символ в текущей позиции головки
+     */
+    Symbol GetCurrentSymbol() const {
+        return strip_->GetSymbolAt(head_manager_->GetPosition());
+    }
+    
+    /**
+     * Получить сегмент ленты
+     */
+    std::vector<Symbol> GetTapeSegment(int start_pos, size_t length) const {
+        return strip_->GetSegment(start_pos, length);
     }
     
     /**
      * Проверить, находится ли машина в конечном состоянии
      */
     bool IsInFinalState() const {
-        return states_.IsInFinalState();
+        return state_manager_->IsInFinalState();
     }
     
     /**
      * Получить количество выполненных шагов
      */
     size_t GetStepCount() const {
-        return step_count_;
-    }
-    
-    /**
-     * Получить максимальное количество шагов
-     */
-    size_t GetMaxSteps() const {
-        return max_steps_;
+        return statistics_manager_->GetStepCount();
     }
     
     /**
      * Получить время выполнения
      */
     std::chrono::milliseconds GetExecutionTime() const {
-        return execution_time_;
-    }
-    
-    // =================
-    // Работа с лентой
-    // =================
-    
-    /**
-     * Получить символ по позиции
-     */
-    Symbol GetSymbolAt(int position) const {
-        return tape_.GetSymbolAt(position);
+        return statistics_manager_->GetExecutionTime();
     }
     
     /**
-     * Получить символ в текущей позиции головки
+     * Получить статистику выполнения
      */
-    Symbol ReadCurrentSymbol() const {
-        return tape_.GetSymbolAt(head_.GetPosition());
+    void PrintStatistics(std::ostream& out = std::cout) const {
+        statistics_manager_->PrintStatistics(out);
+        head_manager_->PrintMoveStatistics(out);
     }
     
     /**
-     * Получить сегмент ленты
+     * Получить количество правил
      */
-    std::vector<Symbol> GetTapeSegment(int start_position, size_t length) const {
-        return tape_.GetSegment(start_position, length);
+    size_t GetRulesCount() const {
+        return transition_manager_->GetRulesCount();
     }
     
     /**
      * Получить пустой символ
      */
     const Symbol& GetBlankSymbol() const {
-        return tape_.GetBlankSymbol();
+        return strip_->GetBlankSymbol();
     }
     
-    // =================
-    // Управление
-    // =================
-    
     /**
-     * Сбросить машину в начальное состояние
+     * Получить начальное состояние
      */
-    void Reset() {
-        states_.Reset();
-        head_.Reset();
-        tape_.Reset();
-        step_count_ = 0;
-        execution_time_ = std::chrono::milliseconds(0);
+    const State& GetInitialState() const {
+        return state_manager_->GetInitialState();
     }
     
-    // =================
-    // Отладка и визуализация
-    // =================
+    // ===================
+    // Дополнительные методы управления
+    // ===================
     
     /**
-     * Вывести текущее состояние машины
+     * Установить максимальное количество шагов
      */
-    void PrintState(std::ostream& out = std::cout, int tape_window = 20) const {
-        out << "Шаг: " << step_count_ << ", ";
-        out << "Состояние: " << states_.GetCurrentState() << ", ";
-        out << "Позиция: " << head_.GetPosition() << std::endl;
+    void SetMaxSteps(size_t max_steps) {
+        statistics_manager_->SetMaxSteps(max_steps);
+    }
+    
+    /**
+     * Установить символ в определенную позицию
+     */
+    void SetSymbolAt(int position, const Symbol& symbol) {
+        strip_->SetSymbolAt(position, symbol);
+    }
+    
+    /**
+     * Получить символ в определенной позиции
+     */
+    Symbol GetSymbolAt(int position) const {
+        return strip_->GetSymbolAt(position);
+    }
+    
+    /**
+     * Переместить головку в определенную позицию
+     */
+    void SetHeadPosition(int position) {
+        head_manager_->SetPosition(position);
+    }
+    
+    /**
+     * Установить текущее состояние
+     */
+    void SetCurrentState(const State& state) {
+        state_manager_->SetCurrentState(state);
+    }
+    
+    /**
+     * Проверить, существует ли правило для данной конфигурации
+     */
+    bool HasTransition(const State& state, const Symbol& symbol) const {
+        return transition_manager_->HasRule(state, symbol);
+    }
+    
+    /**
+     * Получить строковое представление конфигурации машины
+     */
+    std::string GetConfigurationString(int tape_window = 20) const {
+        std::ostringstream oss;
         
-        // Выводим участок ленты вокруг головки
-        int start = head_.GetPosition() - tape_window / 2;
-        auto segment = tape_.GetSegment(start, tape_window);
+        // Информация о состоянии
+        oss << "Состояние: " << state_manager_->GetCurrentState() 
+            << ", Позиция: " << head_manager_->GetPosition() << std::endl;
         
-        out << "Лента: ";
+        // Отображение сегмента ленты
+        int start_pos = head_manager_->GetPosition() - tape_window / 2;
+        auto segment = strip_->GetSegment(start_pos, tape_window);
+        
+        oss << "Лента: ";
         for (size_t i = 0; i < segment.size(); ++i) {
-            int pos = start + static_cast<int>(i);
-            if (pos == head_.GetPosition()) {
-                out << "[" << segment[i] << "]";
+            int pos = start_pos + static_cast<int>(i);
+            if (pos == head_manager_->GetPosition()) {
+                oss << "[" << segment[i] << "]";
             } else {
-                out << " " << segment[i] << " ";
+                oss << " " << segment[i] << " ";
             }
         }
-        out << std::endl;
+        oss << std::endl;
+        
+        return oss.str();
+    }
+    
+    // ===================
+    // Методы для работы с менеджерами напрямую (если нужно)
+    // ===================
+    
+    /**
+     * Получить доступ к менеджеру состояний
+     */
+    StateManager<State>& GetStateManager() { 
+        return *state_manager_; 
+    }
+    
+    const StateManager<State>& GetStateManager() const { 
+        return *state_manager_; 
     }
     
     /**
-     * Вывести статистику выполнения
+     * Получить доступ к ленте
      */
-    void PrintStatistics(std::ostream& out = std::cout) const {
-        out << "=== Статистика выполнения ===" << std::endl;
-        out << "Шагов выполнено: " << step_count_ << std::endl;
-        out << "Максимально шагов: " << max_steps_ << std::endl;
-        out << "Время выполнения: " << execution_time_.count() << " мс" << std::endl;
-        out << "Конечное состояние: " << (IsInFinalState() ? "Да" : "Нет") << std::endl;
-        out << "Материализовано ячеек ленты: " << tape_.GetMaterializedCount() << std::endl;
-        out << "Модификаций ленты: " << tape_.GetModificationsCount() << std::endl;
+    TuringStrip<Symbol>& GetStrip() { 
+        return *strip_; 
     }
     
-private:
+    const TuringStrip<Symbol>& GetStrip() const { 
+        return *strip_; 
+    }
+    
     /**
-     * Отладочный вывод шага
+     * Получить доступ к менеджеру переходов
      */
-    void PrintDebugStep(const Rule& rule) const {
-        std::cout << "[Отладка] Применяем правило: ("
-                  << rule.from_state << ", " << rule.read_symbol << ") -> ("
-                  << rule.to_state << ", " << rule.write_symbol << ", ";
-        
-        switch (rule.direction) {
-            case Direction::LEFT: std::cout << "LEFT"; break;
-            case Direction::STAY: std::cout << "STAY"; break;
-            case Direction::RIGHT: std::cout << "RIGHT"; break;
-        }
-        
-        std::cout << ")" << std::endl;
-        PrintState(std::cout, 10);
-        std::cout << std::endl;
+    TransitionManager<State, Symbol>& GetTransitionManager() { 
+        return *transition_manager_; 
+    }
+    
+    const TransitionManager<State, Symbol>& GetTransitionManager() const { 
+        return *transition_manager_; 
+    }
+    
+    /**
+     * Получить доступ к менеджеру головки
+     */
+    HeadManager& GetHeadManager() { 
+        return *head_manager_; 
+    }
+    
+    const HeadManager& GetHeadManager() const { 
+        return *head_manager_; 
+    }
+    
+    /**
+     * Получить доступ к менеджеру статистики
+     */
+    StatisticsManager& GetStatisticsManager() { 
+        return *statistics_manager_; 
+    }
+    
+    const StatisticsManager& GetStatisticsManager() const { 
+        return *statistics_manager_; 
     }
 };
+
+/**
+ * Вспомогательная функция для создания машины Тьюринга
+ */
+template <typename State, typename Symbol>
+UniquePtr<TuringMachine<State, Symbol>> MakeTuringMachine(
+    const State& initial_state,
+    const Symbol& blank_symbol,
+    const std::vector<Symbol>& initial_data = {},
+    int initial_head_position = 0) {
+    
+    return UniquePtr<TuringMachine<State, Symbol>>::MakeUnique(
+        initial_state, blank_symbol, initial_data, initial_head_position);
+}
